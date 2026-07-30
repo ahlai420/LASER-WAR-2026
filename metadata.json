@@ -1,0 +1,6 @@
+{
+  "name": "Laser War",
+  "description": "A turn-based strategy game involving lasers, mirrors, and AI opponents. Protect your King, manipulate light, and defeat the AI Core.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

@@ -1,0 +1,57 @@
+/*
+ * Referenced by index.html but missing from the project, so every load
+ * started with a 404. It now holds the keyframes that used to be injected
+ * through inline <style> tags during render.
+ */
+
+body {
+  background-color: #020617; /* slate-950 */
+  margin: 0;
+  overflow: hidden;
+}
+
+@keyframes float {
+  0%   { transform: translateY(0) rotate(0deg); opacity: 0; }
+  50%  { opacity: 0.5; }
+  100% { transform: translateY(-100px) rotate(180deg); opacity: 0; }
+}
+
+.particle {
+  position: absolute;
+  background: #6e7376;
+  border-radius: 50%;
+  animation: float 10s infinite linear;
+}
+
+@keyframes popIn {
+  0%   { transform: scale(0); opacity: 0; }
+  50%  { transform: scale(1.2); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+/* Dice cube faces */
+.perspective-1000 { perspective: 1000px; }
+.preserve-3d { transform-style: preserve-3d; }
+.translate-z-12 { transform: translateZ(48px); }
+.rotate-y-180 { transform: rotateY(180deg) translateZ(48px); }
+.rotate-y-90 { transform: rotateY(90deg) translateZ(48px); }
+.rotate-y-m90 { transform: rotateY(-90deg) translateZ(48px); }
+.rotate-x-90 { transform: rotateX(90deg) translateZ(48px); }
+.rotate-x-m90 { transform: rotateX(-90deg) translateZ(48px); }
+
+@keyframes spin-dice {
+  0%   { transform: rotateX(0) rotateY(0); }
+  100% { transform: rotateX(720deg) rotateY(720deg); }
+}
+.animate-spin-3d { animation: spin-dice 0.6s linear infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .particle { display: none; }
+}
