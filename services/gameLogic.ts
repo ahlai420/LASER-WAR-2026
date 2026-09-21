@@ -1,8 +1,12 @@
 import {
-  PieceType, Owner, GRID_SIZE, LASER_RULES,
-  Piece, Board, Position, Direction, DirKey, LaserResult, GameConfig
+  PieceType, Owner, GRID_SIZE,
+  Piece, Board, Position, Direction, DirKey, GameConfig, Difficulty
 } from '../types';
+import {
+  traceBeam, cellCentre, INTENSITY_FLOOR, TraceResult, Vec
+} from './optics';
 
+/** Piece movement directions. Light no longer uses these -- see optics.ts. */
 export const DIRS: Record<DirKey, Direction> = {
   UP:    { x: 0,  y: -1, label: 'UP' },
   RIGHT: { x: 1,  y: 0,  label: 'RIGHT' },
@@ -15,46 +19,6 @@ export const DIRS: Record<DirKey, Direction> = {
 };
 
 export const ORTHOGONAL: Direction[] = [DIRS.UP, DIRS.RIGHT, DIRS.DOWN, DIRS.LEFT];
-
-/**
- * Prism optics as a lookup table instead of an if/else ladder.
- *
- * Mapping is identical to the original implementation: hitting a leg (flat
- * face) reflects the beam 90 degrees (TIR), hitting the hypotenuse refracts it
- * onto the matching diagonal. Diagonal input along the prism's own refraction
- * axis passes straight through, which is what allows multi-prism chains.
- * Anything not listed is absorbed and the beam dies.
- */
-const PRISM_OPTICS: Record<number, Partial<Record<DirKey, { out: DirKey; kind: 'reflect' | 'refract' }>>> = {
-  0: {
-    UP:    { out: 'LEFT', kind: 'reflect' },
-    RIGHT: { out: 'DOWN', kind: 'reflect' },
-    DOWN:  { out: 'SW',   kind: 'refract' },
-    LEFT:  { out: 'SW',   kind: 'refract' },
-    SW:    { out: 'SW',   kind: 'refract' }
-  },
-  90: {
-    DOWN:  { out: 'LEFT', kind: 'reflect' },
-    RIGHT: { out: 'UP',   kind: 'reflect' },
-    UP:    { out: 'NW',   kind: 'refract' },
-    LEFT:  { out: 'NW',   kind: 'refract' },
-    NW:    { out: 'NW',   kind: 'refract' }
-  },
-  180: {
-    DOWN:  { out: 'RIGHT', kind: 'reflect' },
-    LEFT:  { out: 'UP',    kind: 'reflect' },
-    UP:    { out: 'NE',    kind: 'refract' },
-    RIGHT: { out: 'NE',    kind: 'refract' },
-    NE:    { out: 'NE',    kind: 'refract' }
-  },
-  270: {
-    UP:    { out: 'RIGHT', kind: 'reflect' },
-    LEFT:  { out: 'DOWN',  kind: 'reflect' },
-    DOWN:  { out: 'SE',    kind: 'refract' },
-    RIGHT: { out: 'SE',    kind: 'refract' },
-    SE:    { out: 'SE',    kind: 'refract' }
-  }
-};
 
 export const EMPTY_CELL = (): Piece => ({ type: PieceType.EMPTY, owner: Owner.NONE, rotation: 0 });
 
@@ -72,7 +36,40 @@ export const opponentOf = (owner: Owner) => (owner === Owner.PLAYER ? Owner.AI :
 
 // --- BOARD SETUP -------------------------------------------------------------
 
-export const createBoard = (config: Pick<GameConfig, 'prismCount' | 'blockCount'>): Board => {
+/**
+ * How many hits a generator survives. On the teaching tiers one clean shot
+ * ends it, which keeps a demonstration short. On MODERATE and HARD it takes
+ * two, so a single lucky beam no longer decides the match and both sides have
+ * to work an angle twice.
+ */
+export const coreHealthFor = (difficulty: Difficulty): number =>
+  difficulty === 'NORMAL' || difficulty === 'HARD' ? 2 : 1;
+
+/**
+ * DEMO lane. In DEMO the board is seeded with one prism on the opponent's home
+ * row, in the player's starting column, so a single total internal reflection
+ * can reach the opponent's generator:
+ *
+ *   row 0:  [AI shooter] . . [AI core] <- <- <- [PRISM]
+ *                                                  ^
+ *   col 7:                                         ^  (rows 1-6 kept clear)
+ *                                                  ^
+ *   row 7:                      [your core] . . [your shooter]
+ *
+ * The prism starts at 90 deg, so the first shot strikes the slanted face and
+ * refracts out -- the mirror misconception. Rotating it to 0 deg turns the
+ * beam through one total internal reflection straight into the core.
+ *
+ * The lane cells are off-limits to the DEMO opponent so the set-up survives
+ * its turn.
+ */
+export const DEMO_PRISM = { x: GRID_SIZE - 1, y: 0, rotation: 90 } as const;
+
+export const isDemoLane = (x: number, y: number): boolean =>
+  (x === GRID_SIZE - 1 && y <= GRID_SIZE - 2) || (y === 0 && x >= 3);
+
+export const createBoard = (config: Pick<GameConfig, 'prismCount' | 'blockCount' | 'difficulty'>): Board => {
+  const coreHp = coreHealthFor(config.difficulty);
   const board: Board = Array.from({ length: GRID_SIZE }, () =>
     Array.from({ length: GRID_SIZE }, EMPTY_CELL)
   );
@@ -80,8 +77,17 @@ export const createBoard = (config: Pick<GameConfig, 'prismCount' | 'blockCount'
   board[0][0] = { type: PieceType.SHOOTER, owner: Owner.AI, rotation: 180 };
   board[GRID_SIZE - 1][GRID_SIZE - 1] = { type: PieceType.SHOOTER, owner: Owner.PLAYER, rotation: 0 };
 
-  board[0][3] = { type: PieceType.KING, owner: Owner.AI, rotation: 180 };
-  board[GRID_SIZE - 1][4] = { type: PieceType.KING, owner: Owner.PLAYER, rotation: 0 };
+  board[0][3] = { type: PieceType.KING, owner: Owner.AI, rotation: 180, health: coreHp };
+  board[GRID_SIZE - 1][4] = { type: PieceType.KING, owner: Owner.PLAYER, rotation: 0, health: coreHp };
+
+  const demo = config.difficulty === 'DEMO';
+  if (demo) {
+    board[DEMO_PRISM.y][DEMO_PRISM.x] = {
+      type: PieceType.PRISM,
+      owner: Owner.NONE,
+      rotation: DEMO_PRISM.rotation
+    };
+  }
 
   const placeRandom = (count: number, type: PieceType, validRows: number[]) => {
     let placed = 0;
@@ -89,6 +95,7 @@ export const createBoard = (config: Pick<GameConfig, 'prismCount' | 'blockCount'
     while (placed < count && attempts < 200) {
       const r = validRows[Math.floor(Math.random() * validRows.length)];
       const c = Math.floor(Math.random() * GRID_SIZE);
+      if (demo && isDemoLane(c, r)) { attempts++; continue; }
       if (board[r][c].type === PieceType.EMPTY) {
         board[r][c] = {
           type,
@@ -122,97 +129,50 @@ export const findPiece = (board: Board, type: PieceType, owner: Owner): Position
 
 // --- LASER -------------------------------------------------------------------
 
+// --- FIRING --------------------------------------------------------------
+
 /**
- * Traces the beam from a shooter. Pure: never touches React state.
+ * Which shots may destroy a generator.
  *
- * Cycle detection on (x, y, direction) is required now that refracted beams
- * keep travelling -- two facing prisms would otherwise loop forever.
+ *  'physical'  — anything that arrives with power, including a lucky refracted
+ *                beam. This is what real optics does, so it is the default.
+ *  'classroom' — only a beam still travelling along a row or column, i.e. one
+ *                carried entirely by total internal reflection. Refraction
+ *                knocks the beam onto an odd angle and disqualifies it. Use
+ *                this when the lesson has to be enforced for marking.
  */
-export const traceLaser = (board: Board, shooterPos: Position | null, owner: Owner): LaserResult => {
-  const empty: LaserResult = {
-    path: [], prismHits: 0, tirHits: 0, hit: null,
-    exited: false, end: 'absorbed', dispersedFrom: null
-  };
-  if (!shooterPos) return empty;
+export type KillRule = 'physical' | 'classroom';
 
-  const path: Position[] = [{ x: shooterPos.x, y: shooterPos.y }];
-  let dir: Direction = owner === Owner.PLAYER ? DIRS.UP : DIRS.DOWN;
-  let x = shooterPos.x + dir.x;
-  let y = shooterPos.y + dir.y;
+export const isAxisAligned = (d: Vec, tol = 1e-6) =>
+  Math.abs(d.x) < tol || Math.abs(d.y) < tol;
 
-  let prismHits = 0;
-  let tirHits = 0;
-  let steps = 0;
-  const seen = new Set<string>();
+export interface ShotResult extends TraceResult {
+  owner: Owner;
+  /** Full-power reflections; drives combo scoring. */
+  tir: number;
+}
 
-  const done = (
-    end: LaserResult['end'],
-    hit: LaserResult['hit'] = null,
-    dispersedFrom: number | null = null
-  ): LaserResult => ({
-    path, prismHits, tirHits, hit,
-    exited: end === 'exit', end, dispersedFrom
+/** Fire the shooter belonging to `owner`. Pure. */
+export const fireBeam = (
+  board: Board,
+  shooter: Position | null,
+  owner: Owner,
+  rule: KillRule = 'physical'
+): ShotResult | null => {
+  if (!shooter) return null;
+  const direction: Vec = owner === Owner.PLAYER ? { x: 0, y: -1 } : { x: 0, y: 1 };
+  const trace = traceBeam(board, cellCentre(shooter), direction, {
+    ignoreCell: shooter,
+    stopOnRefraction: rule === 'classroom'
   });
+  return { ...trace, owner, tir: trace.tirCount };
+};
 
-  while (steps < LASER_RULES.maxSteps) {
-    if (!inBounds(x, y)) {
-      path.push({ x, y });
-      return done('exit');
-    }
-
-    const key = `${x},${y},${dir.label}`;
-    if (seen.has(key)) {
-      // Beam is looping; treat it as dissipated rather than hanging the trace.
-      return done('loop');
-    }
-    seen.add(key);
-
-    path.push({ x, y });
-    const cell = board[y][x];
-
-    if (
-      cell.type === PieceType.BLOCK ||
-      cell.type === PieceType.SHOOTER ||
-      cell.type === PieceType.KING
-    ) {
-      return done('hit', { pos: { x, y }, piece: cell });
-    }
-
-    if (cell.type === PieceType.PRISM) {
-      const rule = PRISM_OPTICS[((cell.rotation % 360) + 360) % 360]?.[dir.label];
-      if (!rule) {
-        return done('absorbed', { pos: { x, y }, piece: cell });
-      }
-      dir = DIRS[rule.out];
-      prismHits++;
-
-      if (rule.kind === 'reflect') {
-        // Total internal reflection: no loss, beam stays lethal.
-        tirHits++;
-      } else if (!LASER_RULES.refractionContinues) {
-        /*
-         * Refraction: the light crosses the glass boundary twice and leaves
-         * scattered and weakened. Draw the leak so the loss is visible, then
-         * stop. Returning no `hit` is what makes a refracted beam harmless --
-         * it cannot destroy a generator even if one is right there.
-         */
-        const dispersedFrom = path.length - 1;
-        for (let leak = 1; leak <= LASER_RULES.refractionLeakTiles; leak++) {
-          const nx = x + dir.x * leak;
-          const ny = y + dir.y * leak;
-          if (!inBounds(nx, ny)) break;
-          path.push({ x: nx, y: ny });
-        }
-        return done('dispersed', null, dispersedFrom);
-      }
-    }
-
-    x += dir.x;
-    y += dir.y;
-    steps++;
-  }
-
-  return done('absorbed');
+export const shotDestroysCore = (shot: ShotResult | null, rule: KillRule): boolean => {
+  if (!shot?.hit || shot.hit.piece.type !== PieceType.KING) return false;
+  if (shot.intensity < INTENSITY_FLOOR) return false;
+  if (rule === 'classroom') return isAxisAligned(shot.direction);
+  return true;
 };
 
 // --- MOVEMENT ----------------------------------------------------------------
@@ -280,9 +240,10 @@ export const legalShooterSlots = (board: Board, owner: Owner): Position[] => {
 
 // --- SCORING -----------------------------------------------------------------
 
-export const calculateScore = (prismHits: number): number => {
-  if (prismHits === 0) return 50;
-  if (prismHits === 1) return 100;
-  if (prismHits === 2) return 200;
-  return prismHits * 100 * 2; // SUPER COMBO
+/** Scoring counts total internal reflections only. Refraction earns nothing. */
+export const calculateScore = (tirCount: number): number => {
+  if (tirCount === 0) return 50;
+  if (tirCount === 1) return 100;
+  if (tirCount === 2) return 200;
+  return tirCount * 100 * 2; // SUPER COMBO
 };

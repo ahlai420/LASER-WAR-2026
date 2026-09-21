@@ -2,8 +2,9 @@ import {
   PieceType, Owner, GRID_SIZE, Board, Position, Difficulty
 } from '../types';
 import {
-  traceLaser, findPiece, legalShooterSlots, getLegalMoves,
-  isControllable, applyMove, applyRotation, opponentOf, homeRow
+  fireBeam, shotDestroysCore, findPiece, legalShooterSlots, getLegalMoves,
+  isControllable, applyMove, applyRotation, opponentOf, homeRow, KillRule,
+  isDemoLane
 } from './gameLogic';
 
 /**
@@ -41,7 +42,7 @@ interface Weights {
    * that always aims optimally is dangerous no matter how badly it moves --
    * EASY has to aim sloppily too or it isn't actually easy.
    */
-  aim: 'random' | 'best';
+  aim: 'random' | 'best' | 'harmless';
   /**
    * Chance per turn of settling for the second-best firing position. Without
    * this, NORMAL and HARD play almost identically -- the defense weight only
@@ -51,6 +52,12 @@ interface Weights {
 };
 
 const WEIGHTS: Record<Difficulty, Weights> = {
+  /*
+   * DEMO never lines up a kill. It still moves, still fires, still shows the
+   * beam doing real optics -- it just always chooses a firing position that
+   * leaves the player's core standing, so a demonstration can run to the end.
+   */
+  DEMO:   { defense: 0.0,  noise: 1.0, topK: 1, aim: 'harmless', blunder: 0 },
   EASY:   { defense: 0.0,  noise: 1.0, topK: 1, aim: 'random', blunder: 0 },
   NORMAL: { defense: 0.55, noise: 0.0, topK: 3, aim: 'best',   blunder: 0.4 },
   HARD:   { defense: 1.0,  noise: 0.0, topK: 1, aim: 'best',   blunder: 0 }
@@ -73,7 +80,7 @@ interface ShotEval {
  * Best shot available to `owner` on this board, considering every legal
  * shooter placement on their home row (repositioning before firing is free).
  */
-export const rankedShots = (board: Board, owner: Owner): ShotEval[] => {
+export const rankedShots = (board: Board, owner: Owner, killRule: KillRule = 'physical'): ShotEval[] => {
   const shooter = findPiece(board, PieceType.SHOOTER, owner);
   const enemyKing = findPiece(board, PieceType.KING, opponentOf(owner));
   if (!shooter) return [];
@@ -85,18 +92,31 @@ export const rankedShots = (board: Board, owner: Owner): ShotEval[] => {
       ? board
       : applyMove(board, shooter, slot);
 
-    const { path, tirHits, hit } = traceLaser(sim, slot, owner);
+    const shot = fireBeam(sim, slot, owner);
+    if (!shot) continue;
+    const tirHits = shot.tir;
+    const hit = shot.hit;
 
     let value: number;
     if (hit && hit.piece.type === PieceType.KING) {
+      const lethal = shotDestroysCore(shot, killRule);
       value = hit.piece.owner === owner
-        ? SUICIDE_VALUE
-        : KILL_VALUE + tirHits * 500;
+        ? (lethal ? SUICIDE_VALUE : -400)
+        : (lethal
+            // An armoured core survives the first breach, so that shot is
+            // strong but not game-ending. Only the last layer is a kill.
+            ? ((hit.piece.health ?? 1) <= 1
+                ? KILL_VALUE + tirHits * 500
+                : KILL_VALUE / 4 + tirHits * 200)
+            : 600);
     } else {
       // No kill: reward getting the beam close to the target and using optics.
       let closest = GRID_SIZE * 2;
       if (enemyKing) {
-        for (const p of path) closest = Math.min(closest, manhattan(p, enemyKing));
+        const target = { x: enemyKing.x + 0.5, y: enemyKing.y + 0.5 };
+        for (const seg of shot.segments) {
+          closest = Math.min(closest, Math.abs(seg.to.x - target.x) + Math.abs(seg.to.y - target.y));
+        }
       }
       // Only TIR is worth chasing; a refracted beam is a dead end for the AI too.
       value = (GRID_SIZE * 2 - closest) * 30 + tirHits * 25;
@@ -111,8 +131,8 @@ export const rankedShots = (board: Board, owner: Owner): ShotEval[] => {
   return out.sort((a, b) => b.value - a.value);
 };
 
-export const bestShot = (board: Board, owner: Owner): ShotEval => {
-  const ranked = rankedShots(board, owner);
+export const bestShot = (board: Board, owner: Owner, killRule: KillRule = 'physical'): ShotEval => {
+  const ranked = rankedShots(board, owner, killRule);
   if (ranked.length) return ranked[0];
   return {
     value: 0,
@@ -128,16 +148,23 @@ const evaluate = (board: Board, me: Owner, w: Weights): number => {
   return mine.value - theirs.value * w.defense;
 };
 
-const enumerateActions = (board: Board, me: Owner, ap: number): AIAction[] => {
+const enumerateActions = (
+  board: Board,
+  me: Owner,
+  ap: number,
+  guard: (x: number, y: number) => boolean = () => false
+): AIAction[] => {
   const actions: AIAction[] = [];
 
   for (let y = 0; y < GRID_SIZE; y++) {
     for (let x = 0; x < GRID_SIZE; x++) {
       const cell = board[y][x];
       if (!isControllable(cell, me)) continue;
+      if (guard(x, y)) continue;
       const from = { x, y };
 
       for (const to of getLegalMoves(board, from, ap)) {
+        if (guard(to.x, to.y)) continue;
         actions.push({
           kind: 'MOVE',
           from,
@@ -173,13 +200,15 @@ const applyAction = (board: Board, action: AIAction): Board => {
 export const planTurn = (board: Board, ap: number, difficulty: Difficulty): AIPlan => {
   const w = WEIGHTS[difficulty];
   const me = Owner.AI;
+  // DEMO keeps the teaching lane intact for the player's next shot.
+  const guard = difficulty === 'DEMO' ? isDemoLane : () => false;
 
   let current = board;
   let remaining = ap;
   const actions: AIAction[] = [];
 
   while (remaining > 0) {
-    const candidates = enumerateActions(current, me, remaining).filter(a => a.cost <= remaining);
+    const candidates = enumerateActions(current, me, remaining, guard).filter(a => a.cost <= remaining);
     if (candidates.length === 0) break;
 
     const baseline = evaluate(current, me, w);
@@ -203,7 +232,7 @@ export const planTurn = (board: Board, ap: number, difficulty: Difficulty): AIPl
     actions.push(chosen.action);
 
     // A guaranteed kill is on the board; stop spending and take the shot.
-    if (bestShot(current, me).kills && Math.random() >= w.blunder) break;
+    if (w.aim !== 'harmless' && bestShot(current, me).kills && Math.random() >= w.blunder) break;
   }
 
   // Free aim step: slide the shooter into its firing position.
@@ -214,6 +243,12 @@ export const planTurn = (board: Board, ap: number, difficulty: Difficulty): AIPl
       const ranked = rankedShots(current, me);
       const idx = w.blunder > 0 && ranked.length > 1 && Math.random() < w.blunder ? 1 : 0;
       target = ranked[idx]?.from ?? null;
+    } else if (w.aim === 'harmless') {
+      const ranked = rankedShots(current, me);
+      const safe = ranked.filter(sh => !sh.kills && !(sh.from && guard(sh.from.x, sh.from.y)));
+      // Prefer any non-lethal position; if every option kills, take the weakest.
+      const pool = safe.length ? safe : ranked.filter(sh => !(sh.from && guard(sh.from.x, sh.from.y))).slice(-1);
+      target = pool.length ? pool[Math.floor(Math.random() * pool.length)].from : null;
     } else {
       const slots = legalShooterSlots(current, me);
       target = slots.length ? slots[Math.floor(Math.random() * slots.length)] : null;
